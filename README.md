@@ -90,11 +90,11 @@ flowchart LR
     F[DiscordLogHandler] -->|queued embeds| G[#bot-log channel]
 ```
 
-- **SQLite storage** — two tables (`votes`, `prices`) with a context-managed connection (commit-on-success, guaranteed close). A one-time migration imports the legacy `votes.json` on first boot.
-- **Persistent views** — vote buttons use fixed `custom_id`s and are re-registered on startup, so they keep working across restarts.
-- **Discord-native logging** — a custom `logging.Handler` ships INFO+ records to a log channel as color-coded embeds via a non-blocking queue, with loop-protection against discord.py's own chatter.
-- **Interaction audit trail** — every slash command and button press is logged with the user, options, and channel.
-- **3-second rule respected** — button clicks are acknowledged immediately; DB writes, message edits, and log sends happen after the ack so the interaction token never expires mid-vote.
+- **SQLite storage** : two tables (`votes`, `prices`) with a context-managed connection (commit-on-success, guaranteed close). A one-time migration imports the legacy `votes.json` on first boot.
+- **Persistent views** : vote buttons use fixed `custom_id`s and are re-registered on startup, so they keep working across restarts.
+- **Discord-native logging** : a custom `logging.Handler` ships INFO+ records to a log channel as color-coded embeds via a non-blocking queue, with loop-protection against discord.py's own chatter.
+- **Interaction audit trail** : every slash command and button press is logged with the user, options, and channel.
+- **3-second rule respected** : button clicks are acknowledged immediately; DB writes, message edits, and log sends happen after the ack so the interaction token never expires mid-vote.
 
 ---
 
