@@ -19,7 +19,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 intents = discord.Intents.default()
 intents.message_content = True
 
-BOT_VERSION = "1.0.1"
+BOT_VERSION = "1.0.2"
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "1523400321747910706"))
 GUILD_ICON_URL = os.getenv(
     "GUILD_ICON_URL",
