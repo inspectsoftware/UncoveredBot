@@ -1,6 +1,6 @@
 <div align="center">
 
-# 💎 Prices Uncovered — Live Price Bot
+# 💎 Prices Uncovered - Live Price Bot
 
 **A Discord bot for tracking Growtopia item prices with community-driven accuracy voting, full price history, and automatic dispute detection.**
 
@@ -36,7 +36,7 @@ Vote state is keyed by message ID in SQLite, so votes survive restarts and nobod
 <td>
 
 **⚠️ Automatic dispute detection**
-When a price collects enough inaccurate votes (configurable threshold + ratio), it's flagged **Disputed — needs a re-check** on the embed and the price editor role gets pinged.
+When a price collects enough inaccurate votes (configurable threshold + ratio), it's flagged **Disputed - needs a re-check** on the embed and the price editor role gets pinged.
 
 </td>
 <td>
@@ -57,16 +57,16 @@ A daily background task reports items whose latest price is older than a configu
 | Command | Description |
 |---|---|
 | `/checkprice <item>` | Look up the latest recorded price for an item (with autocomplete + fuzzy matching) |
-| `/pricehistory <item>` | Timeline of an item's price movements — posts 📦 and edits 📝 |
+| `/pricehistory <item>` | Timeline of an item's price movements - posts 📦 and edits 📝 |
 
 ### Price editors (role-gated)
 
 | Command | Description |
 |---|---|
-| `/postprice` | Post a full price dashboard embed — item, price, demand, trend, variant, emoji, thumbnail, banner, proof pic, notes, target channel |
+| `/postprice` | Post a full price dashboard embed - item, price, demand, trend, variant, emoji, thumbnail, banner, proof pic, notes, target channel |
 | `/editprice <message>` | Edit any field of an already-posted price via message link or ID; marks it *(edited)* and records the change in history |
 | `/deleteprice <message>` | Delete a price post and wipe its vote data |
-| `/votes [message]` | Vote breakdown for one price — or, with no argument, a leaderboard of the most disputed prices |
+| `/votes [message]` | Vote breakdown for one price - or, with no argument, a leaderboard of the most disputed prices |
 | `/version` | Show the running bot version |
 
 ### Admin / owner
@@ -119,7 +119,7 @@ Set your environment variables (only `DISCORD_TOKEN` is strictly required):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DISCORD_TOKEN` | — *(required)* | Bot token |
+| `DISCORD_TOKEN` | - *(required)* | Bot token |
 | `PRICE_EDITOR_ROLE_ID` | built-in ID | Role allowed to post/edit/delete prices |
 | `LOG_CHANNEL_ID` | built-in ID | Channel for vote logs |
 | `BOT_LOG_CHANNEL_ID` | built-in ID | Channel for interaction audit + info/warning/error embeds |
@@ -143,7 +143,7 @@ On first boot the bot creates `pricebot.db`, migrates any legacy `votes.json`, r
 
 | Table | Contents |
 |---|---|
-| `votes` | One row per `(message_id, user_id)` — enforces one vote per user per price |
+| `votes` | One row per `(message_id, user_id)` - enforces one vote per user per price |
 | `prices` | Append-only history: every `post` and `edit` with item, price, demand, trend, poster, and source message |
 
 `prices.item_key` (lowercased) is indexed for fast autocomplete and fuzzy lookups.
