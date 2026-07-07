@@ -1,1 +1,3 @@
 discord.py>=2.3
+growtopia-api>=0.2.3
+Pillow>=10

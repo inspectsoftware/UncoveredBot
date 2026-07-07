@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import datetime
+import io
 import json
 import logging
 import os
@@ -13,13 +14,15 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
+import gtitems
+
 # Forces UTF-8 so emojis never break again on Windows.
 sys.stdout.reconfigure(encoding="utf-8")
 
 intents = discord.Intents.default()
 intents.message_content = True
 
-BOT_VERSION = "1.0.2"
+BOT_VERSION = "1.1.0"
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "1523400321747910706"))
 GUILD_ICON_URL = os.getenv(
     "GUILD_ICON_URL",
@@ -145,6 +148,30 @@ def init_db() -> None:
             )"""
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_item_key ON prices(item_key, created_at)")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                name_lower TEXT NOT NULL,
+                description TEXT,
+                item_type INTEGER,
+                rarity INTEGER,
+                clothing_type INTEGER,
+                max_hold INTEGER,
+                hardness INTEGER,
+                collision_type INTEGER,
+                file_name TEXT,
+                tex_x INTEGER,
+                tex_y INTEGER
+            )"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_items_name_lower ON items(name_lower)")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS item_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )"""
+        )
 
 
 def migrate_votes_json() -> None:
@@ -248,6 +275,148 @@ async def item_autocomplete(interaction: discord.Interaction, current: str) -> l
             (f"%{current.lower()}%",),
         ).fetchall()
     return [app_commands.Choice(name=r["item"], value=r["item"]) for r in rows]
+
+
+# --- Growtopia item database (items.dat) ---
+
+def get_item_meta(key: str) -> str | None:
+    with db() as conn:
+        row = conn.execute("SELECT value FROM item_meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def store_items(source_file: str, parsed: dict) -> None:
+    """Replace the items table with a freshly parsed items.dat."""
+    with db() as conn:
+        conn.execute("DELETE FROM items")
+        conn.executemany(
+            "INSERT INTO items (id, name, name_lower, description, item_type, rarity, clothing_type, "
+            "max_hold, hardness, collision_type, file_name, tex_x, tex_y) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    it["id"], it["name"], it["name"].lower(), it.get("description"),
+                    it["type"], it["rarity"], it["clothing_type"], it["max_hold"],
+                    it["hardness"], it["collision_type"], it["file_name"], it["tex_x"], it["tex_y"],
+                )
+                for it in parsed["items"]
+            ],
+        )
+        meta = {
+            "itemsdat_file": source_file,
+            "format_version": str(parsed["version"]),
+            "item_count": str(parsed["item_count"]),
+            "updated_at": utc_now().isoformat(),
+        }
+        conn.executemany(
+            "INSERT INTO item_meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            list(meta.items()),
+        )
+
+
+def item_db_count() -> int:
+    with db() as conn:
+        return conn.execute("SELECT COUNT(*) AS c FROM items").fetchone()["c"]
+
+
+def item_by_id(item_id: int) -> sqlite3.Row | None:
+    with db() as conn:
+        return conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+
+
+def find_item(query: str) -> sqlite3.Row | None:
+    """Exact name match first, then best fuzzy match (shortest name wins)."""
+    q = query.strip().lower()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM items WHERE name_lower = ?", (q,)).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT * FROM items WHERE name_lower LIKE ? ORDER BY LENGTH(name), id LIMIT 1",
+                (f"%{q}%",),
+            ).fetchone()
+    return row
+
+
+async def gt_item_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT name FROM items WHERE name_lower LIKE ? AND name != '' "
+            "ORDER BY LENGTH(name), name LIMIT 25",
+            (f"%{current.lower()}%",),
+        ).fetchall()
+    return [app_commands.Choice(name=r["name"], value=r["name"]) for r in rows]
+
+
+def _sync_update_items(force: bool = False) -> dict:
+    """Blocking item-database update — always call via asyncio.to_thread.
+
+    Fetches the newest items.dat from the mirror (only when the version changed,
+    unless forced), parses + stores it, and downloads the official client for
+    sprite textures whenever they're missing or the data changed.
+    """
+    latest = gtitems.fetch_latest_filename()
+    current = get_item_meta("itemsdat_file")
+    result = {"old": current, "new": latest, "changed": False, "count": None, "textures": None}
+
+    if force or latest != current or item_db_count() == 0:
+        raw = gtitems.download_items_dat(latest)
+        parsed = gtitems.parse_items_dat(raw)
+        store_items(latest, parsed)
+        result["changed"] = True
+        result["count"] = parsed["item_count"]
+
+    if force or result["changed"] or not gtitems.textures_present():
+        try:
+            result["textures"] = gtitems.ensure_textures(force=force or result["changed"])
+        except Exception as e:
+            # Item data is still useful without sprites — don't fail the whole update.
+            log.warning(f"Couldn't refresh client textures: {e}")
+    return result
+
+
+def build_item_embed(row: sqlite3.Row) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"🧱  {row['name']}",
+        url=f"https://growtopia.fandom.com/wiki/{row['name'].replace(' ', '_')}",
+        description=f"> {row['description']}" if row["description"] else None,
+        color=0xc084fc,
+        timestamp=utc_now(),
+    )
+    embed.set_author(name="Prices Uncovered <> Item Database", icon_url=GUILD_ICON_URL)
+    embed.add_field(name="🆔 Item ID", value=str(row["id"]), inline=True)
+    rarity = "None" if row["rarity"] == gtitems.RARITY_NONE else str(row["rarity"])
+    embed.add_field(name="💎 Rarity", value=rarity, inline=True)
+    embed.add_field(name="📦 Type", value=gtitems.item_type_name(row["item_type"]), inline=True)
+    if row["item_type"] == gtitems.CLOTHING_TYPE:
+        embed.add_field(name="👕 Slot", value=gtitems.clothing_slot_name(row["clothing_type"]), inline=True)
+    if row["hardness"]:
+        embed.add_field(name="✊ Break hits", value=f"{max(1, round(row['hardness'] / 6))}", inline=True)
+    embed.add_field(name="📥 Max hold", value=str(row["max_hold"]), inline=True)
+    if row["file_name"]:
+        embed.add_field(
+            name="🖼️ Texture",
+            value=f"`{row['file_name']}` ({row['tex_x']}, {row['tex_y']})",
+            inline=False,
+        )
+    file_meta = get_item_meta("itemsdat_file") or "unknown"
+    embed.set_footer(text=f"items.dat: {file_meta} • Prices Uncovered - {INVITE_URL}")
+    return embed
+
+
+async def build_sprite_file(row: sqlite3.Row, scale: int = 4, filename: str = "sprite.png") -> discord.File | None:
+    """Cropped item sprite as a Discord attachment, or None when unavailable."""
+    try:
+        png = await asyncio.to_thread(
+            gtitems.sprite_png, row["file_name"], row["tex_x"], row["tex_y"], scale
+        )
+    except gtitems.SpriteUnavailable as e:
+        log.info(f"Sprite unavailable for item {row['id']} ({row['name']}): {e}")
+        return None
+    except Exception:
+        log.exception(f"Sprite rendering failed for item {row['id']} ({row['name']})")
+        return None
+    return discord.File(io.BytesIO(png), filename=filename)
 
 
 def extract_embed_price_data(embed: discord.Embed) -> tuple[str | None, str | None, str | None]:
@@ -453,6 +622,8 @@ class GrowPriceBot(discord.Client):
         # Re-register the persistent view so buttons keep working after restarts.
         self.add_view(PremiumPriceView())
         stale_price_sweep.start()
+        # Runs immediately on start, so an empty items table gets populated on first boot.
+        items_update_sweep.start()
         await self.tree.sync()
         log.info("Slash commands synced, running live.")
 
@@ -1016,6 +1187,146 @@ async def pricehistory(interaction: discord.Interaction, item: str):
     )
     embed.set_footer(text=f"Last {len(rows)} entries • 📦 post / 📝 edit")
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# --- Growtopia item database commands ---
+
+@bot.tree.command(name="searchitem", description="Search the Growtopia item database")
+@app_commands.autocomplete(item=gt_item_autocomplete)
+@app_commands.describe(item="Item name (e.g. Dirt)")
+async def searchitem(interaction: discord.Interaction, item: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if item_db_count() == 0:
+        await interaction.followup.send(
+            "❌ The item database is empty — an editor needs to run `/updateitems` first.", ephemeral=True
+        )
+        return
+
+    row = find_item(item)
+    if row is None:
+        await interaction.followup.send(f"❌ No item found matching **{item}**.", ephemeral=True)
+        return
+
+    embed = build_item_embed(row)
+    sprite = await build_sprite_file(row)
+    if sprite:
+        embed.set_thumbnail(url="attachment://sprite.png")
+        await interaction.followup.send(embed=embed, file=sprite, ephemeral=True)
+    else:
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="iteminfo", description="Look up a Growtopia item by its exact item ID")
+@app_commands.describe(item_id="Item ID (e.g. 2 for Dirt)")
+async def iteminfo(interaction: discord.Interaction, item_id: app_commands.Range[int, 0]):
+    await interaction.response.defer(ephemeral=True)
+
+    row = item_by_id(item_id)
+    if row is None:
+        await interaction.followup.send(f"❌ No item with ID **{item_id}** in the database.", ephemeral=True)
+        return
+
+    embed = build_item_embed(row)
+    sprite = await build_sprite_file(row)
+    if sprite:
+        embed.set_thumbnail(url="attachment://sprite.png")
+        await interaction.followup.send(embed=embed, file=sprite, ephemeral=True)
+    else:
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="itemsprite", description="Download an item's sprite as a PNG")
+@app_commands.autocomplete(item=gt_item_autocomplete)
+@app_commands.describe(item="Item name", scale="Upscale factor (1 = original 32x32)")
+async def itemsprite(interaction: discord.Interaction, item: str, scale: app_commands.Range[int, 1, 8] = 4):
+    await interaction.response.defer(ephemeral=True)
+
+    row = find_item(item)
+    if row is None:
+        await interaction.followup.send(f"❌ No item found matching **{item}**.", ephemeral=True)
+        return
+
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", row["name"]).strip("_") or f"item_{row['id']}"
+    sprite = await build_sprite_file(row, scale=scale, filename=f"{safe_name}.png")
+    if sprite is None:
+        await interaction.followup.send(
+            f"❌ No sprite available for **{row['name']}** — textures may not be downloaded yet "
+            "(`/updateitems force:True`).",
+            ephemeral=True,
+        )
+        return
+    await interaction.followup.send(
+        f"🖼️ **{row['name']}** (ID {row['id']}) at {scale}x", file=sprite, ephemeral=True
+    )
+
+
+@bot.tree.command(name="itemdb", description="Item database status: version, item count, last update")
+async def itemdb(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    count = item_db_count()
+    embed = discord.Embed(title="🗃️ Item database", color=0x67e8f9, timestamp=utc_now())
+    embed.add_field(name="📄 items.dat", value=get_item_meta("itemsdat_file") or "—", inline=True)
+    embed.add_field(name="🔢 Format", value=f"v{get_item_meta('format_version') or '—'}", inline=True)
+    embed.add_field(name="🧱 Items", value=f"{count:,}", inline=True)
+
+    updated_at = get_item_meta("updated_at")
+    if updated_at:
+        ts = int(datetime.datetime.fromisoformat(updated_at).timestamp())
+        embed.add_field(name="🕰️ Last update", value=f"<t:{ts}:R>", inline=True)
+    embed.add_field(name="🖼️ Textures", value=f"{gtitems.texture_count():,} sheets", inline=True)
+    sprites, size = gtitems.sprite_cache_stats()
+    embed.add_field(name="✂️ Sprite cache", value=f"{sprites:,} ({size / 1024:.0f} KB)", inline=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="updateitems", description="Force-refresh the item database (items.dat + client textures)")
+@app_commands.checks.has_role(PRICE_EDITOR_ROLE_ID)
+@app_commands.describe(force="Re-download everything even if the version hasn't changed")
+async def updateitems(interaction: discord.Interaction, force: bool = False):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        result = await asyncio.to_thread(_sync_update_items, force)
+    except Exception as e:
+        log.exception("/updateitems failed")
+        await interaction.followup.send(f"❌ Item database update failed: {e}", ephemeral=True)
+        return
+
+    if result["changed"]:
+        msg = (
+            f"✅ Item database updated: **{result['old'] or 'none'}** → **{result['new']}** "
+            f"({result['count']:,} items)."
+        )
+        if result["textures"]:
+            msg += f"\n🖼️ Client textures refreshed: {result['textures']:,} sheets."
+        log.info(
+            f"Item database updated to {result['new']} by {interaction.user} ({interaction.user.id})"
+        )
+    else:
+        msg = f"✅ Already up to date (**{result['new']}**)."
+    await interaction.followup.send(msg, ephemeral=True)
+
+
+@tasks.loop(hours=24)
+async def items_update_sweep():
+    """Daily items.dat check — also populates the database on first boot."""
+    try:
+        result = await asyncio.to_thread(_sync_update_items, False)
+    except Exception:
+        log.exception("Scheduled item database update failed")
+        return
+    if result["changed"]:
+        log.info(
+            f"Item database auto-updated: {result['old'] or 'none'} → {result['new']} "
+            f"({result['count']:,} items, {result['textures'] or 0} textures)."
+        )
+
+
+@items_update_sweep.before_loop
+async def _items_wait_for_bot():
+    await bot.wait_until_ready()
 
 
 @tasks.loop(hours=24)

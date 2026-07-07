@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Live bot data — never commit runtime state
+pricebot.db
+votes.json
+votes.json.migrated
+
+# Growtopia item data caches (re-downloadable via /updateitems)
+gtdata/
+item_cache/
+
+# Secrets / local env
+.env
