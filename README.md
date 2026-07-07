@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/python-3.10+-blue?logo=python&logoColor=white)
 ![discord.py](https://img.shields.io/badge/discord.py-2.3+-5865F2?logo=discord&logoColor=white)
 ![SQLite](https://img.shields.io/badge/storage-SQLite-003B57?logo=sqlite&logoColor=white)
-![Version](https://img.shields.io/badge/version-1.1.0-c084fc)
+![Version](https://img.shields.io/badge/version-1.2.0-c084fc)
 
 </div>
 
@@ -56,7 +56,7 @@ The bot auto-downloads the latest `items.dat` (16,000+ items), parses it with a 
 <td>
 
 **🖼️ Item sprite rendering**
-Item sprites are cropped straight out of the game's RTTEX texture sheets (harvested from a local Growtopia install and/or the game CDN), converted to PNG, upscaled, cached, and attached to embeds.
+Item sprites are cropped straight out of the game's RTTEX texture sheets, converted to PNG, upscaled, cached, and attached to embeds. Textures come from a local Growtopia install, a configurable CDN, or - on headless hosts - by **automatically downloading the official client** and extracting all ~1,900 sheets from it.
 
 </td>
 </tr>
@@ -114,7 +114,7 @@ flowchart LR
 
 - **SQLite storage** : four tables (`votes`, `prices`, `items`, `item_meta`) with a context-managed connection (commit-on-success, guaranteed close). A one-time migration imports the legacy `votes.json` on first boot.
 - **Built-in items.dat decoder** ([gtitems.py](gtitems.py)) : parses the game's binary item database (XOR-encrypted names, versioned field layout up to format v26) entirely in-repo, so a game update can't silently break lookups - unknown formats fail loudly.
-- **Sprite pipeline** : texture sheets are harvested from a local Growtopia install (base sheets + live-update deltas) or a configurable CDN, decoded from RTTEX via `growtopia-api`, cropped to the item's 32x32 tile, upscaled with nearest-neighbor, and cached as PNGs on disk. Missing textures degrade gracefully to sprite-less embeds.
+- **Sprite pipeline** : texture sheets are harvested from a local Growtopia install (base sheets + live-update deltas), a configurable CDN, or - as a zero-setup fallback - the official macOS client download, which 7-Zip extracts on any platform (~1,900 sheets, one-time ~313 MB download guarded by a marker file). Sheets are decoded from RTTEX via `growtopia-api`, cropped to the item's 32x32 tile, upscaled with nearest-neighbor, and cached as PNGs on disk. Missing textures degrade gracefully to sprite-less embeds.
 - **Persistent views** : vote buttons use fixed `custom_id`s and are re-registered on startup, so they keep working across restarts.
 - **Discord-native logging** : a custom `logging.Handler` ships INFO+ records to a log channel as color-coded embeds via a non-blocking queue, with loop-protection against discord.py's own chatter.
 - **Interaction audit trail** : every slash command and button press is logged with the user, options, and channel.
@@ -128,7 +128,7 @@ flowchart LR
 
 - Python **3.10+** (uses `X | None` union syntax)
 - A Discord bot application with the **Message Content** intent enabled
-- *(optional, for item sprites)* a local Growtopia client install - its texture sheets are harvested automatically
+- *(optional, for item sprites)* a **7-Zip binary** (`7z` on PATH; bundled with `growtopia-api` on Windows) so the bot can extract textures from the auto-downloaded client - or a local Growtopia install, which is used directly
 
 ### 2. Install
 
@@ -156,6 +156,7 @@ Set your environment variables (only `DISCORD_TOKEN` is strictly required):
 | `ITEMS_MIRROR_BASE` | StileDevs/itemsdat-archive | Mirror that tracks the live game's `items.dat` |
 | `GT_LOCAL_CACHE` | `%LOCALAPPDATA%\Growtopia` | Root of a local Growtopia install to harvest texture sheets from |
 | `GT_CDN_BASE` | - *(unset)* | Game asset CDN base URL (`.../cache`) as a texture fallback - the build slug changes per client release |
+| `GT_CLIENT_URL` | official mac dmg | Client download used as the texture source of last resort on hosts without a Growtopia install |
 
 ### 4. Run
 

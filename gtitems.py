@@ -7,9 +7,12 @@ Data sources:
 - items.dat comes from the community mirror (StileDevs/itemsdat-archive), which
   tracks the live game. The real client receives items.dat over ENet at runtime,
   so there is no official HTTP download for it.
-- Sprite texture sheets (.rttex) are harvested from a local Growtopia client
-  install cache when available (GT_LOCAL_CACHE) and/or downloaded from the
-  game CDN when GT_CDN_BASE is configured.
+- Sprite texture sheets (.rttex) are harvested, in order of preference, from:
+  1. a local Growtopia client install (GT_LOCAL_CACHE),
+  2. the game asset CDN when configured (GT_CDN_BASE),
+  3. the official macOS client download (GT_CLIENT_URL) — auto-downloaded and
+     extracted with 7-Zip, so headless hosts get sprites with zero setup
+     beyond having a 7z binary available.
 """
 
 import io
@@ -18,6 +21,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,7 +35,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "gtdata")
 TEXTURES_DIR = os.path.join(DATA_DIR, "textures")
 SPRITES_DIR = os.path.join(DATA_DIR, "sprites")
+CLIENT_TMP_DIR = os.path.join(DATA_DIR, "client_tmp")
 NEEDED_TEXTURES_FILE = os.path.join(DATA_DIR, "needed_textures.json")
+HARVEST_MARKER_FILE = os.path.join(DATA_DIR, "client_harvest.json")
 
 # Community mirror that tracks the live game's items.dat.
 ITEMS_MIRROR_BASE = os.getenv(
@@ -42,16 +48,25 @@ ITEMS_MIRROR_BASE = os.getenv(
 # The <build> slug changes per client release and is only embedded in the client,
 # so this stays configurable instead of hardcoded.
 GT_CDN_BASE = os.getenv("GT_CDN_BASE", "").rstrip("/")
-# Root folder of an installed Growtopia client — the most reliable texture source.
+# Root folder of an installed Growtopia client, the most reliable texture source.
 # Base sheets live in game/, live-updated deltas in cache/game/; the recursive
-# index prefers cache/ (walked first) so patched sheets win.
-GT_LOCAL_CACHE = os.getenv(
-    "GT_LOCAL_CACHE",
-    os.path.join(os.getenv("LOCALAPPDATA", ""), "Growtopia"),
+# index prefers cache/ (walked first) so patched sheets win. Defaults to the
+# standard Windows install location only when LOCALAPPDATA actually exists.
+GT_LOCAL_CACHE = os.getenv("GT_LOCAL_CACHE") or (
+    os.path.join(os.environ["LOCALAPPDATA"], "Growtopia") if os.getenv("LOCALAPPDATA") else ""
 )
+# Official client download used as the texture source of last resort. The macOS
+# build is a plain disk image whose Resources/game folder holds every sheet,
+# and 7-Zip can extract it on any platform.
+GT_CLIENT_URL = os.getenv("GT_CLIENT_URL", "https://growtopiagame.com/Growtopia-mac.dmg")
 
 HTTP_TIMEOUT = 30
-MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024  # sanity cap for any single download
+MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024  # sanity cap for any single small download
+MAX_CLIENT_BYTES = 2 * 1024 * 1024 * 1024  # cap for the client disk image
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
 
 XOR_KEY = "PBG892FXX982ABC*"
 
@@ -96,6 +111,19 @@ def _http_get(url: str) -> bytes:
     if len(data) > MAX_DOWNLOAD_BYTES:
         raise ValueError(f"Download exceeded {MAX_DOWNLOAD_BYTES} bytes: {url}")
     return data
+
+
+def _download_to_file(url: str, dest: str, max_bytes: int) -> int:
+    """Stream a large download to disk. Returns the byte count."""
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+    total = 0
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp, open(dest, "wb") as f:
+        while chunk := resp.read(1024 * 1024):
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"Download exceeded {max_bytes} bytes: {url}")
+            f.write(chunk)
+    return total
 
 
 # --- items.dat fetching ---
@@ -305,11 +333,99 @@ def _fetch_texture(file_name: str, local_index: dict[str, str] | None = None) ->
     return False
 
 
+# --- Texture source of last resort: the official client download ---
+
+def _find_7z() -> str | None:
+    for name in ("7z", "7zz", "7za"):
+        path = shutil.which(name)
+        if path:
+            return path
+    if os.name == "nt":
+        # growtopia-api ships a bundled 7z.exe for its dataminer — reuse it.
+        try:
+            import growtopia
+            bundled = os.path.join(os.path.dirname(growtopia.__file__), "dataminer", "bin", "7z.exe")
+            if os.path.isfile(bundled):
+                return bundled
+        except ImportError:
+            pass
+    return None
+
+
+def _harvest_already_attempted(missing: list[str]) -> bool:
+    """True when a client harvest was already tried for exactly this missing set,
+    so the (large) client download isn't repeated for permanently absent sheets."""
+    try:
+        with open(HARVEST_MARKER_FILE, encoding="utf-8") as f:
+            return json.load(f).get("missing") == sorted(missing)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+
+
+def _record_harvest_attempt(missing: list[str]) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(HARVEST_MARKER_FILE, "w", encoding="utf-8") as f:
+        json.dump({"missing": sorted(missing)}, f)
+
+
+def _harvest_from_client(missing: list[str]) -> int:
+    """Download the official client and pull every .rttex sheet out of it.
+
+    Copies ALL sheets found (not just the currently missing ones) into
+    TEXTURES_DIR so future items.dat updates don't need another download.
+    Returns how many of the missing sheets were recovered.
+    """
+    exe = _find_7z()
+    if exe is None:
+        log.warning(
+            "Can't harvest textures from the Growtopia client: no 7-Zip binary "
+            "found. Install 7-Zip/p7zip (7z on PATH) to enable automatic "
+            "client texture downloads."
+        )
+        return 0
+
+    shutil.rmtree(CLIENT_TMP_DIR, ignore_errors=True)
+    os.makedirs(CLIENT_TMP_DIR, exist_ok=True)
+    dmg = os.path.join(CLIENT_TMP_DIR, "Growtopia.dmg")
+    try:
+        log.info(f"Downloading the Growtopia client to harvest {len(missing)} texture sheets…")
+        size = _download_to_file(GT_CLIENT_URL, dmg, MAX_CLIENT_BYTES)
+        log.info(f"Client downloaded ({size / 1024 / 1024:.0f} MB) — extracting textures…")
+
+        out_dir = os.path.join(CLIENT_TMP_DIR, "extracted")
+        proc = subprocess.run(
+            [exe, "x", dmg, f"-o{out_dir}", "*.rttex", "-r", "-aoa", "-y"],
+            capture_output=True, text=True, timeout=1800,
+        )
+        if proc.returncode not in (0, 1):  # 1 = extracted with warnings
+            log.warning(f"7-Zip exited with code {proc.returncode}: {(proc.stderr or '')[-400:]}")
+
+        os.makedirs(TEXTURES_DIR, exist_ok=True)
+        harvested = 0
+        seen: set[str] = set()
+        for root, _, files in os.walk(out_dir):
+            for name in files:
+                if name.endswith(".rttex") and name not in seen:
+                    seen.add(name)
+                    shutil.copyfile(os.path.join(root, name), os.path.join(TEXTURES_DIR, name))
+                    harvested += 1
+        recovered = sum(1 for n in missing if os.path.isfile(_texture_path(n)))
+        log.info(
+            f"Client harvest done: {harvested} sheets extracted, "
+            f"{recovered}/{len(missing)} missing sheets recovered."
+        )
+        return recovered
+    finally:
+        shutil.rmtree(CLIENT_TMP_DIR, ignore_errors=True)
+
+
 def ensure_textures(force: bool = False) -> int:
     """Make sure every referenced texture sheet is present locally.
 
+    Tries the local client install and the CDN per sheet; if sheets are still
+    missing, downloads the official client once and extracts everything from it.
     Returns the number of sheets available afterwards. Missing sheets are not an
-    error — sprites for them will simply be unavailable.
+    error, sprites for them will simply be unavailable.
     """
     needed = _needed_textures()
     if not needed:
@@ -321,11 +437,20 @@ def ensure_textures(force: bool = False) -> int:
         if force or not os.path.isfile(_texture_path(name)):
             if not _fetch_texture(name, local_index):
                 missing.append(name)
+
+    if missing and (force or not _harvest_already_attempted(missing)):
+        try:
+            _harvest_from_client(missing)
+        except Exception as e:
+            log.warning(f"Client texture harvest failed: {e}")
+        _record_harvest_attempt(missing)
+        missing = [n for n in missing if not os.path.isfile(_texture_path(n))]
+
     if missing:
         log.warning(
-            f"{len(missing)}/{len(needed)} texture sheets unavailable "
-            f"(no local client cache at '{GT_LOCAL_CACHE}' and "
-            f"{'no GT_CDN_BASE configured' if not GT_CDN_BASE else 'CDN misses'}). "
+            f"{len(missing)}/{len(needed)} texture sheets unavailable after trying "
+            f"local install ('{GT_LOCAL_CACHE or 'not set'}'), "
+            f"CDN ({GT_CDN_BASE or 'not set'}) and the client download. "
             "Sprites for those items will be missing."
         )
     return texture_count()
