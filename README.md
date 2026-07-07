@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/python-3.10+-blue?logo=python&logoColor=white)
 ![discord.py](https://img.shields.io/badge/discord.py-2.3+-5865F2?logo=discord&logoColor=white)
 ![SQLite](https://img.shields.io/badge/storage-SQLite-003B57?logo=sqlite&logoColor=white)
-![Version](https://img.shields.io/badge/version-1.2.0-c084fc)
+![Version](https://img.shields.io/badge/version-1.2.1-c084fc)
 
 </div>
 
@@ -128,7 +128,7 @@ flowchart LR
 
 - Python **3.10+** (uses `X | None` union syntax)
 - A Discord bot application with the **Message Content** intent enabled
-- *(optional, for item sprites)* a **7-Zip binary** (`7z` on PATH; bundled with `growtopia-api` on Windows) so the bot can extract textures from the auto-downloaded client - or a local Growtopia install, which is used directly
+- Item sprites need no setup: the bot finds an installed 7-Zip (`7z` on PATH, or the copy bundled with `growtopia-api` on Windows) or **auto-downloads the official static build** (Linux x64/arm64, macOS) to extract textures from the client
 
 ### 2. Install
 

@@ -19,9 +19,12 @@ import io
 import json
 import logging
 import os
+import platform
 import re
 import shutil
+import stat
 import subprocess
+import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -59,6 +62,11 @@ GT_LOCAL_CACHE = os.getenv("GT_LOCAL_CACHE") or (
 # build is a plain disk image whose Resources/game folder holds every sheet,
 # and 7-Zip can extract it on any platform.
 GT_CLIENT_URL = os.getenv("GT_CLIENT_URL", "https://growtopiagame.com/Growtopia-mac.dmg")
+# Official static 7-Zip builds, auto-downloaded when no 7z binary is installed.
+# 7-zip.org only hosts the current release, so the GitHub mirror (which keeps
+# every version forever) is tried as a fallback.
+SEVENZIP_VERSION = os.getenv("GT_7Z_VERSION", "2602")
+SEVENZIP_DIR = os.path.join(DATA_DIR, "bin")
 
 HTTP_TIMEOUT = 30
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024  # sanity cap for any single small download
@@ -349,7 +357,64 @@ def _find_7z() -> str | None:
                 return bundled
         except ImportError:
             pass
+    # Previously auto-downloaded static build.
+    cached = os.path.join(SEVENZIP_DIR, "7zz")
+    if os.path.isfile(cached):
+        return cached
     return None
+
+
+def _download_7z() -> str | None:
+    """Fetch the official static 7-Zip build for this platform (Linux/macOS).
+
+    The full 7-Zip is needed because the client is a .dmg; 7zr/7za can't read
+    those. Windows hosts are covered by growtopia-api's bundled 7z.exe.
+    """
+    system = platform.system()
+    machine = platform.machine().lower()
+    if system == "Linux":
+        arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(machine)
+        if arch is None:
+            log.warning(f"No static 7-Zip build for Linux/{machine} — install p7zip manually.")
+            return None
+        archive_name = f"7z{SEVENZIP_VERSION}-linux-{arch}.tar.xz"
+    elif system == "Darwin":
+        archive_name = f"7z{SEVENZIP_VERSION}-mac.tar.xz"
+    else:
+        return None
+
+    version_tag = f"{SEVENZIP_VERSION[:2]}.{SEVENZIP_VERSION[2:]}"  # 2602 -> 26.02
+    sources = [
+        f"https://7-zip.org/a/{archive_name}",
+        f"https://github.com/ip7z/7zip/releases/download/{version_tag}/{archive_name}",
+    ]
+    for url in sources:
+        try:
+            log.info(f"No 7-Zip installed — downloading the official static build ({url})…")
+            data = _http_get(url)
+        except (urllib.error.URLError, ValueError) as e:
+            log.warning(f"7-Zip download failed from {url}: {e}")
+            continue
+        try:
+            os.makedirs(SEVENZIP_DIR, exist_ok=True)
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:xz") as tar:
+                member = tar.getmember("7zz")
+                fobj = tar.extractfile(member)
+                if fobj is None:
+                    raise ValueError("7zz missing from the 7-Zip archive")
+                dest = os.path.join(SEVENZIP_DIR, "7zz")
+                with open(dest, "wb") as f:
+                    shutil.copyfileobj(fobj, f)
+            os.chmod(dest, os.stat(dest).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            log.info("Static 7-Zip ready.")
+            return dest
+        except Exception as e:
+            log.warning(f"Couldn't extract the static 7-Zip build: {e}")
+    return None
+
+
+def _ensure_7z() -> str | None:
+    return _find_7z() or _download_7z()
 
 
 def _harvest_already_attempted(missing: list[str]) -> bool:
@@ -368,21 +433,22 @@ def _record_harvest_attempt(missing: list[str]) -> None:
         json.dump({"missing": sorted(missing)}, f)
 
 
-def _harvest_from_client(missing: list[str]) -> int:
+def _harvest_from_client(missing: list[str]) -> int | None:
     """Download the official client and pull every .rttex sheet out of it.
 
     Copies ALL sheets found (not just the currently missing ones) into
     TEXTURES_DIR so future items.dat updates don't need another download.
-    Returns how many of the missing sheets were recovered.
+    Returns how many of the missing sheets were recovered, or None when no
+    harvest could even be attempted (no 7-Zip available).
     """
-    exe = _find_7z()
+    exe = _ensure_7z()
     if exe is None:
         log.warning(
             "Can't harvest textures from the Growtopia client: no 7-Zip binary "
-            "found. Install 7-Zip/p7zip (7z on PATH) to enable automatic "
-            "client texture downloads."
+            "found and the static build download failed. Install 7-Zip/p7zip "
+            "(7z on PATH) to enable automatic client texture downloads."
         )
-        return 0
+        return None
 
     shutil.rmtree(CLIENT_TMP_DIR, ignore_errors=True)
     os.makedirs(CLIENT_TMP_DIR, exist_ok=True)
@@ -439,11 +505,15 @@ def ensure_textures(force: bool = False) -> int:
                 missing.append(name)
 
     if missing and (force or not _harvest_already_attempted(missing)):
+        attempted = None
         try:
-            _harvest_from_client(missing)
+            attempted = _harvest_from_client(missing)
         except Exception as e:
             log.warning(f"Client texture harvest failed: {e}")
-        _record_harvest_attempt(missing)
+        # Only remember real attempts — a missing 7-Zip shouldn't block a retry
+        # after the admin installs it (or the static build download recovers).
+        if attempted is not None:
+            _record_harvest_attempt(missing)
         missing = [n for n in missing if not os.path.isfile(_texture_path(n))]
 
     if missing:
